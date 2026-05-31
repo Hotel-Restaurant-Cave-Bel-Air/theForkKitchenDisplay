@@ -1,3 +1,4 @@
+check webhook
 Install "ViolentMonkey" browser extension and install this script from https://greasyfork.org/en/scripts/556851-thefork-manager-kitchen-display
 
 Visit your TheFork frontend, there should be a "Affiche cuisine" button on the lower right corner.
