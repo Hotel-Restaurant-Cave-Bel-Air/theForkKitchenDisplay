@@ -3,7 +3,7 @@
 // @license      GPL
 // @author       Nova Chervet
 // @namespace    http://tampermonkey.net/
-// @version      1.6.1
+// @version      1.6.2
 // @description  Displays a kitchen view in TheFork manager
 // @icon         https://avatars.githubusercontent.com/u/1640261?s=200&v=4
 // @match        https://manager.thefork.com/*
@@ -729,7 +729,10 @@
 		}
 	}
 
-	function getRestaurantUuid() {
+	let cachedRestaurantUuid = null;
+
+	// Ancienne méthode : UUID dans le JWT stocké en localStorage (avant la MAJ TheFork de nov. 2026)
+	function getRestaurantUuidFromToken() {
 		const token = getTheForkToken();
 		if (!token) return null;
 
@@ -746,6 +749,35 @@
 		}
 
 		return null;
+	}
+
+	// Nouvelle méthode : l'auth passe par cookie httpOnly, on demande l'UUID à l'API (query `me`)
+	async function getRestaurantUuidFromApi() {
+		try {
+			const res = await fetch(GRAPHQL_URL, {
+				method: 'POST',
+				credentials: 'include',
+				headers: {
+					'Content-Type': 'application/json',
+					'Accept': 'application/json',
+					'x-app-name': 'tfm-front',
+				},
+				body: JSON.stringify({ query: 'query { me { restaurantUuid } }' })
+			});
+			if (!res.ok) return null;
+			const json = await res.json();
+			return (json && json.data && json.data.me && json.data.me.restaurantUuid) || null;
+		} catch (e) {
+			console.error('[TheFork kitchen display] Erreur récupération restaurant UUID via API', e);
+			return null;
+		}
+	}
+
+	async function getRestaurantUuid() {
+		if (cachedRestaurantUuid) return cachedRestaurantUuid;
+		const uuid = getRestaurantUuidFromToken() || await getRestaurantUuidFromApi();
+		if (uuid) cachedRestaurantUuid = uuid;
+		return uuid;
 	}
 
 	function escapeHtml(str) {
@@ -1651,11 +1683,11 @@
 
 		const query = buildDayReservationsQuery();
 
-		const restaurantUuid = getRestaurantUuid();
+		const restaurantUuid = await getRestaurantUuid();
 		if (!restaurantUuid) {
 			if (errorEl) {
 				setStatus('error');
-				errorEl.textContent = 'Impossible de trouver le restaurant UUID (token TheFork incomplet).';
+				errorEl.textContent = 'Impossible de trouver le restaurant UUID (session TheFork expirée ? recharge la page).';
 			}
 			return;
 		}
@@ -1771,11 +1803,11 @@
 			headerSubtitle.textContent = `Groupes · menu preset ou ${groupMinCover}+ couverts · aujourd’hui + 10 prochains jours`;
 		}
 
-		const restaurantUuid = getRestaurantUuid();
+		const restaurantUuid = await getRestaurantUuid();
 		if (!restaurantUuid) {
 			if (errorEl) {
 				setStatus('error');
-				errorEl.textContent = 'Impossible de trouver le restaurant UUID (token TheFork incomplet).';
+				errorEl.textContent = 'Impossible de trouver le restaurant UUID (session TheFork expirée ? recharge la page).';
 			}
 			return;
 		}
