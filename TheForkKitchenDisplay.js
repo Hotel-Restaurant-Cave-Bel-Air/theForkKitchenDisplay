@@ -3,7 +3,7 @@
 // @license      GPL
 // @author       Nova Chervet
 // @namespace    http://tampermonkey.net/
-// @version      1.6.2
+// @version      1.6.3
 // @description  Displays a kitchen view in TheFork manager
 // @icon         https://avatars.githubusercontent.com/u/1640261?s=200&v=4
 // @match        https://manager.thefork.com/*
@@ -729,6 +729,70 @@
 		}
 	}
 
+	const REFRESH_TOKEN_URL = 'https://manager.thefork.com/api/refresh-token';
+
+	// Depuis la MAJ TheFork (nov. 2026), l'auth passe par des cookies httpOnly :
+	// un jeton d'accès court, renouvelé via POST /api/refresh-token quand l'API répond 401.
+	// L'app TheFork le fait elle-même ; on fait pareil pour que l'écran cuisine ne reste pas bloqué.
+	let refreshPromise = null;
+
+	function refreshSession() {
+		// Si plusieurs requêtes prennent un 401 en même temps, un seul renouvellement est lancé
+		if (!refreshPromise) {
+			refreshPromise = fetch(REFRESH_TOKEN_URL, { method: 'POST', credentials: 'include' })
+				.then(res => res.ok)
+				.catch(() => false)
+				.finally(() => { refreshPromise = null; });
+		}
+		return refreshPromise;
+	}
+
+	// POST GraphQL avec renouvellement automatique de session (1 seul essai) en cas de 401.
+	// Renvoie le JSON de la réponse ; lève une erreur (avec .code / .userMessage) si HTTP en échec.
+	async function gqlFetch(payload) {
+		const send = () => {
+			const headers = {
+				'Content-Type': 'application/json',
+				'Accept': 'application/json',
+				'x-app-name': 'tfm-front',
+			};
+			const token = getTheForkToken(); // ancien système (JWT en localStorage), absent depuis la MAJ
+			if (token) {
+				headers['Authorization'] = 'Bearer ' + token;
+			}
+			return fetch(GRAPHQL_URL, {
+				method: 'POST',
+				credentials: 'include',
+				headers,
+				body: JSON.stringify(payload)
+			});
+		};
+
+		let res = await send();
+
+		if (res.status === 401) {
+			console.info('[TheFork kitchen display] 401 reçu, renouvellement de la session…');
+			if (await refreshSession()) {
+				res = await send();
+			}
+		}
+
+		if (res.status === 401) {
+			const err = new Error('HTTP 401 après renouvellement de session');
+			err.code = 'UNAUTHENTICATED';
+			err.userMessage = 'Session TheFork expirée. Recharge la page et reconnecte-toi.';
+			throw err;
+		}
+
+		if (!res.ok) {
+			const err = new Error('Erreur API GraphQL: HTTP ' + res.status);
+			err.userMessage = err.message;
+			throw err;
+		}
+
+		return res.json();
+	}
+
 	let cachedRestaurantUuid = null;
 
 	// Ancienne méthode : UUID dans le JWT stocké en localStorage (avant la MAJ TheFork de nov. 2026)
@@ -754,18 +818,7 @@
 	// Nouvelle méthode : l'auth passe par cookie httpOnly, on demande l'UUID à l'API (query `me`)
 	async function getRestaurantUuidFromApi() {
 		try {
-			const res = await fetch(GRAPHQL_URL, {
-				method: 'POST',
-				credentials: 'include',
-				headers: {
-					'Content-Type': 'application/json',
-					'Accept': 'application/json',
-					'x-app-name': 'tfm-front',
-				},
-				body: JSON.stringify({ query: 'query { me { restaurantUuid } }' })
-			});
-			if (!res.ok) return null;
-			const json = await res.json();
+			const json = await gqlFetch({ query: 'query { me { restaurantUuid } }' });
 			return (json && json.data && json.data.me && json.data.me.restaurantUuid) || null;
 		} catch (e) {
 			console.error('[TheFork kitchen display] Erreur récupération restaurant UUID via API', e);
@@ -1531,87 +1584,123 @@
 	}
 
 
+	// Champs demandés pour chaque réservation (partagés entre la requête 1 jour et la requête multi-jours)
+	const RESERVATION_FIELDS = `
+		id
+		status
+		mealDate
+		seatingTime
+		partySize
+		customerNote
+		restaurantNote
+		offerSnapshot {
+			name
+		}
+		customGroupPresetMenu {
+			price
+			note
+			sections {
+				type
+				name {
+					locale
+					value
+				}
+				items {
+					name {
+						locale
+						value
+					}
+				}
+			}
+		}
+		occasions,
+		customer {
+			firstName
+			lastName
+			phone
+			email
+			isVip
+			favFood
+			allergiesAndIntolerances
+			dietaryRestrictions
+		}
+		tables {
+			items { name }
+		}
+		serviceInstance {
+			service { name }
+		}
+	`;
+
 	function buildDayReservationsQuery() {
 		return `
 			query dayReservations($restaurantUuid: String!, $dayId: String!) {
 				dayReservations(restaurantUuid: $restaurantUuid, dayId: $dayId) {
-					id
-					status
-					mealDate
-					seatingTime
-					partySize
-					customerNote
-					restaurantNote
-					offerSnapshot {
-						name
-					}
-					customGroupPresetMenu {
-						price
-						note
-						sections {
-							type
-							name {
-								locale
-								value
-							}
-							items {
-								name {
-									locale
-									value
-								}
-							}
-						}
-					}
-					occasions,
-					customer {
-						firstName
-						lastName
-						phone
-						email
-						isVip
-						favFood
-						allergiesAndIntolerances
-                        dietaryRestrictions
-					}
-					tables {
-						items { name }
-					}
-					serviceInstance {
-						service { name }
-					}
+					${RESERVATION_FIELDS}
 				}
 			}
 		`;
 	}
 
-	async function fetchDayReservations(restaurantUuid, dayId, token) {
-		const headers = {
-			'Content-Type': 'application/json',
-			'Accept': 'application/json',
-			'x-app-name': 'tfm-front',
-		};
-
-		if (token) {
-			headers['Authorization'] = 'Bearer ' + token;
+	// Plusieurs jours en UNE requête HTTP grâce aux alias GraphQL (d0, d1, ...).
+	// TheFork n'a pas de requête sur une plage de dates pour les réservations, mais les alias
+	// permettent d'appeler dayReservations N fois dans le même appel.
+	function buildMultiDayReservationsQuery(count) {
+		const compactFields = RESERVATION_FIELDS.replace(/\s+/g, ' ').trim();
+		const varDefs = [];
+		const selections = [];
+		for (let i = 0; i < count; i++) {
+			varDefs.push('$d' + i + ': String!');
+			selections.push('d' + i + ': dayReservations(restaurantUuid: $restaurantUuid, dayId: $d' + i + ') { ' + compactFields + ' }');
 		}
+		return 'query multiDayReservations($restaurantUuid: String!, ' + varDefs.join(', ') + ') {\n' + selections.join('\n') + '\n}';
+	}
 
-		const res = await fetch(GRAPHQL_URL, {
-			method: 'POST',
-			credentials: 'include',
-			headers,
-			body: JSON.stringify({
-				query: buildDayReservationsQuery(),
-				variables: { restaurantUuid, dayId }
-			})
+	// Renvoie { byDay: { dayId: [réservations] }, failures: [{ dayId, error }] }.
+	// Erreur HTTP/réseau => exception (tout a échoué). Erreur GraphQL sur un jour => ce jour seulement dans failures.
+	async function fetchMultiDayReservations(restaurantUuid, dayIds) {
+		const variables = { restaurantUuid };
+		dayIds.forEach((dayId, i) => { variables['d' + i] = dayId; });
+
+		const json = await gqlFetch({
+			query: buildMultiDayReservationsQuery(dayIds.length),
+			variables
 		});
+		const data = json.data || {};
+		const errors = json.errors || [];
 
-		if (!res.ok) {
-			const err = new Error('Erreur API GraphQL: HTTP ' + res.status);
-			err.userMessage = err.message;
+		// Erreur sans "path" (requête invalide, session expirée...) : elle concerne toute la requête
+		const globalError = errors.find(e => !e.path || !e.path.length || (e.extensions && e.extensions.code === 'UNAUTHENTICATED'));
+		if (globalError || !json.data) {
+			const first = globalError || errors[0] || {};
+			const err = new Error(first.message || 'Réponse GraphQL vide');
+			err.code = first.extensions && first.extensions.code;
+			err.userMessage = 'Erreur GraphQL: ' + err.message;
 			throw err;
 		}
 
-		const json = await res.json();
+		const byDay = {};
+		const failures = [];
+		dayIds.forEach((dayId, i) => {
+			const alias = 'd' + i;
+			const dayError = errors.find(e => e.path[0] === alias);
+			if (dayError || !Array.isArray(data[alias])) {
+				const err = new Error((dayError && dayError.message) || 'Pas de données');
+				err.code = dayError && dayError.extensions && dayError.extensions.code;
+				failures.push({ dayId, error: err });
+			} else {
+				byDay[dayId] = data[alias];
+			}
+		});
+
+		return { byDay, failures };
+	}
+
+	async function fetchDayReservations(restaurantUuid, dayId) {
+		const json = await gqlFetch({
+			query: buildDayReservationsQuery(),
+			variables: { restaurantUuid, dayId }
+		});
 		if (json.errors && json.errors.length) {
 			const first = json.errors[0];
 			const err = new Error(first.message || JSON.stringify(json.errors));
@@ -1623,12 +1712,67 @@
 		return (json.data && json.data.dayReservations) || [];
 	}
 
+	// Gestion des chargements concurrents :
+	// - chaque chargement reçoit un numéro (fetchSeq) ; seul le plus récent a le droit d'afficher son résultat
+	// - l'auto-refresh est ignoré si un chargement est déjà en cours (évite d'empiler les requêtes)
+	let fetchSeq = 0;
+	let fetchInFlight = false;
+
+	function beginFetch() {
+		fetchInFlight = true;
+		return ++fetchSeq;
+	}
+
+	function isCurrentFetch(seq) {
+		return seq === fetchSeq;
+	}
+
+	function endFetch(seq) {
+		if (!isCurrentFetch(seq)) return;
+		fetchInFlight = false;
+		const refreshBtn = document.getElementById('bk-refresh-btn');
+		if (refreshBtn) {
+			refreshBtn.disabled = false;
+			if (refreshBtn.dataset.originalText) {
+				refreshBtn.textContent = refreshBtn.dataset.originalText;
+			}
+			refreshBtn.classList.remove('bk-refresh-loading');
+		}
+	}
+
+	function showFetchError(e, errorEl) {
+		setStatus('error');
+		if (e && e.code === 'UNAUTHENTICATED') {
+			if (errorEl) {
+				errorEl.textContent = 'Session TheFork expirée ou invalide. Recharge la page et reconnecte-toi.';
+			}
+			if (autoRefreshId) {
+				clearInterval(autoRefreshId);
+				autoRefreshId = null;
+			}
+			return;
+		}
+		if (errorEl) {
+			errorEl.textContent = (e && e.userMessage) || ('Erreur réseau: ' + e);
+		}
+	}
+
+	function missingUuidError() {
+		const err = new Error('restaurant UUID introuvable');
+		err.userMessage = 'Impossible de trouver le restaurant UUID (session TheFork expirée ? recharge la page).';
+		return err;
+	}
+
 	async function fetchAndRender(showLoading) {
+		// Auto-refresh (showLoading = false) : on saute ce tour si un chargement tourne déjà
+		if (!showLoading && fetchInFlight) return;
+
 		if (groupsViewActive) {
 			await fetchAndRenderGroups(showLoading);
 			return;
 		}
 
+		const seq = beginFetch();
 		setStatus('loading');
 		const errorEl = document.getElementById('bk-error');
 		if (errorEl) errorEl.textContent = '';
@@ -1681,76 +1825,14 @@
 			});
 		}
 
-		const query = buildDayReservationsQuery();
-
-		const restaurantUuid = await getRestaurantUuid();
-		if (!restaurantUuid) {
-			if (errorEl) {
-				setStatus('error');
-				errorEl.textContent = 'Impossible de trouver le restaurant UUID (session TheFork expirée ? recharge la page).';
-			}
-			return;
-		}
-
-		const variables = {
-			restaurantUuid,
-			dayId
-		};
-
 		try {
-			const token = getTheForkToken();
+			const restaurantUuid = await getRestaurantUuid();
+			if (!restaurantUuid) throw missingUuidError();
 
-			const headers = {
-				'Content-Type': 'application/json',
-				'Accept': 'application/json',
-				'x-app-name': 'tfm-front',
-			};
+			const reservations = await fetchDayReservations(restaurantUuid, dayId);
+			if (!isCurrentFetch(seq)) return; // un chargement plus récent a été lancé entre-temps
 
-			if (token) {
-				headers['Authorization'] = 'Bearer ' + token;
-			}
-
-			const res = await fetch(GRAPHQL_URL, {
-				method: 'POST',
-				credentials: 'include',
-				headers,
-				body: JSON.stringify({ query, variables })
-			});
-
-			if (!res.ok) {
-				if (errorEl) {
-					setStatus('error');
-					errorEl.textContent = 'Erreur API GraphQL: HTTP ' + res.status;
-				}
-				return;
-			}
-
-			const json = await res.json();
-			if (json.errors && json.errors.length) {
-				setStatus('error');
-				const first = json.errors[0];
-				const code = first.extensions && first.extensions.code;
-
-				if (code === 'UNAUTHENTICATED') {
-					if (errorEl) {
-						errorEl.textContent = 'Session TheFork expirée ou invalide. Recharge la page et reconnecte-toi.';
-					}
-					if (autoRefreshId) {
-						clearInterval(autoRefreshId);
-						autoRefreshId = null;
-					}
-					return;
-				}
-
-				if (errorEl) {
-					errorEl.textContent = 'Erreur GraphQL: ' + (first.message || JSON.stringify(json.errors));
-				}
-				return;
-			}
-
-			const reservations = (json.data && json.data.dayReservations) || [];
 			normalizedData = normalizeReservations(reservations);
-
 			renderReservations();
 
 			const lastRefreshEl = document.getElementById('bk-last-refresh');
@@ -1759,23 +1841,15 @@
 			}
 			setStatus('ok');
 		} catch (e) {
-			if (errorEl) {
-				setStatus('error');
-				errorEl.textContent = 'Erreur réseau: ' + e;
-			}
+			if (isCurrentFetch(seq)) showFetchError(e, errorEl);
 		} finally {
-			if (refreshBtn) {
-				refreshBtn.disabled = false;
-				if (refreshBtn.dataset.originalText) {
-					refreshBtn.textContent = refreshBtn.dataset.originalText;
-				}
-				refreshBtn.classList.remove('bk-refresh-loading');
-			}
+			endFetch(seq);
 		}
 	}
 
 
 	async function fetchAndRenderGroups(showLoading) {
+		const seq = beginFetch();
 		setStatus('loading');
 		const errorEl = document.getElementById('bk-error');
 		if (errorEl) errorEl.textContent = '';
@@ -1803,33 +1877,36 @@
 			headerSubtitle.textContent = `Groupes · menu preset ou ${groupMinCover}+ couverts · aujourd’hui + 10 prochains jours`;
 		}
 
-		const restaurantUuid = await getRestaurantUuid();
-		if (!restaurantUuid) {
-			if (errorEl) {
-				setStatus('error');
-				errorEl.textContent = 'Impossible de trouver le restaurant UUID (session TheFork expirée ? recharge la page).';
-			}
-			return;
-		}
-
 		try {
-			const token = getTheForkToken();
+			const restaurantUuid = await getRestaurantUuid();
+			if (!restaurantUuid) throw missingUuidError();
+
 			const dayIds = [];
 
 			for (let offset = 0; offset <= 10; offset++) {
 				dayIds.push(formatDateId(addDays(base, offset)));
 			}
 
-			const results = await Promise.all(dayIds.map(async dayId => {
-				const reservations = await fetchDayReservations(restaurantUuid, dayId, token);
-				reservations.forEach(r => {
+			// Une seule requête HTTP pour les 11 jours (alias GraphQL) ;
+			// un jour en erreur côté serveur n'empêche pas d'afficher les autres
+			const { byDay, failures } = await fetchMultiDayReservations(restaurantUuid, dayIds);
+
+			if (!isCurrentFetch(seq)) return; // un chargement plus récent a été lancé entre-temps
+
+			const allReservations = [];
+			dayIds.forEach(dayId => {
+				(byDay[dayId] || []).forEach(r => {
 					if (!r) return;
 					r.__dayId = dayId;
+					allReservations.push(r);
 				});
-				return reservations;
-			}));
+			});
 
-			const allReservations = results.flat();
+			// Session expirée ou tous les jours en échec : erreur globale, comme avant
+			const authFailure = failures.find(f => f.error && f.error.code === 'UNAUTHENTICATED');
+			if (authFailure) throw authFailure.error;
+			if (failures.length === dayIds.length) throw failures[0].error;
+
 			groupData = normalizeGroupReservations(allReservations);
 			renderGroups();
 
@@ -1837,28 +1914,25 @@
 			if (lastRefreshEl) {
 				lastRefreshEl.textContent = 'Dernière mise à jour : ' + new Date().toLocaleTimeString('fr-CH', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 			}
-			setStatus('ok');
-		} catch (e) {
-			if (errorEl) {
+
+			if (failures.length) {
+				// Affichage partiel : on signale les jours manquants (format JJ.MM)
+				const days = failures.map(f => {
+					const [, m, d] = f.dayId.split('-');
+					return d + '.' + m;
+				}).join(', ');
+				failures.forEach(f => console.warn('[TheFork kitchen display] Jour ' + f.dayId + ' non chargé', f.error));
 				setStatus('error');
-				if (e.code === 'UNAUTHENTICATED') {
-					errorEl.textContent = 'Session TheFork expirée ou invalide. Recharge la page et reconnecte-toi.';
-					if (autoRefreshId) {
-						clearInterval(autoRefreshId);
-						autoRefreshId = null;
-					}
-				} else {
-					errorEl.textContent = e.userMessage || ('Erreur réseau: ' + e);
+				if (errorEl) {
+					errorEl.textContent = 'Jours non chargés : ' + days + ' (nouvel essai au prochain rafraîchissement)';
 				}
+			} else {
+				setStatus('ok');
 			}
+		} catch (e) {
+			if (isCurrentFetch(seq)) showFetchError(e, errorEl);
 		} finally {
-			if (refreshBtn) {
-				refreshBtn.disabled = false;
-				if (refreshBtn.dataset.originalText) {
-					refreshBtn.textContent = refreshBtn.dataset.originalText;
-				}
-				refreshBtn.classList.remove('bk-refresh-loading');
-			}
+			endFetch(seq);
 		}
 	}
 
@@ -2276,14 +2350,14 @@
 						html +=
 							'<div class="bk-note-line">' +
 							'<span class="bk-note-label">Offre:</span>' +
-							'<span>' + offer + '</span>' +
+							'<span>' + escapeHtml(offer) + '</span>' +
 							'</div>';
 					}
 					if (menu) {
 						html +=
 							'<div class="bk-note-line">' +
 							'<span class="bk-note-label">Menu:</span>' +
-							'<span>' + menu + '</span>' +
+							'<span>' + escapeHtml(menu) + '</span>' +
 							'</div>';
 					}
 					if (note) {
@@ -2333,11 +2407,21 @@
 
 	function start() {
 		init();
+
+		// Retry toutes les 2 s : sur les vieux appareils (iPad cuisine) TheFork charge lentement,
+		// et l'app peut effacer le bouton en changeant de page. createUi() ne fait rien si l'UI existe déjà.
+		let lastUiError = null;
 		setInterval(() => {
 			try {
 				createUi();
+				lastUiError = null;
 			} catch (e) {
-				// don't break
+				// On ne casse rien, mais on logge l'erreur (une seule fois tant qu'elle ne change pas)
+				const msg = String(e);
+				if (msg !== lastUiError) {
+					console.warn('[TheFork kitchen display] createUi a échoué', e);
+					lastUiError = msg;
+				}
 			}
 		}, 2000);
 	}
